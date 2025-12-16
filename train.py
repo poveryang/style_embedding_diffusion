@@ -383,8 +383,10 @@ def main():
     
     # 初始化分布式训练
     use_ddp = False
+    num_available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        # 使用torchrun启动
+        # 使用torchrun启动（推荐方式）
         args.rank = int(os.environ['RANK'])
         args.world_size = int(os.environ['WORLD_SIZE'])
         args.local_rank = int(os.environ['LOCAL_RANK'])
@@ -393,12 +395,19 @@ def main():
     elif args.local_rank != -1:
         # 手动设置DDP
         args.rank = args.rank if args.rank != -1 else args.local_rank
-        args.world_size = args.world_size if args.world_size != -1 else torch.cuda.device_count()
+        args.world_size = args.world_size if args.world_size != -1 else num_available_gpus
         use_ddp = True
         print(f"[DEBUG] 手动设置DDP: rank={args.rank}, world_size={args.world_size}, local_rank={args.local_rank}")
-    else:
-        print(f"[DEBUG] 未检测到DDP环境变量，将使用单GPU训练")
-        print(f"[DEBUG] 要使用DDP，请使用: torchrun --nproc_per_node=4 train.py ...")
+    elif num_available_gpus > 1:
+        # 自动检测多GPU，提示使用DDP
+        print(f"\n⚠️  检测到 {num_available_gpus} 张GPU，但未启用DDP")
+        print(f"   当前将使用单GPU训练（GPU 0）")
+        print(f"\n   要使用所有GPU进行DDP训练，请使用以下命令：")
+        print(f"   torchrun --nproc_per_node={num_available_gpus} train.py \\")
+        print(f"       --data_root <data_path> \\")
+        print(f"       --checkpoint_dir <checkpoint_path>")
+        print(f"\n   或者如果使用调度系统（如Slurm），请确保设置了正确的环境变量")
+        print(f"   继续使用单GPU训练...\n")
     
     if use_ddp:
         # 初始化进程组
@@ -431,6 +440,21 @@ def main():
     np.random.seed(config.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(config.seed)
+        
+        # 检查GPU内存使用情况
+        if is_main_process:
+            for i in range(torch.cuda.device_count()):
+                allocated = torch.cuda.memory_allocated(i) / 1024**3  # GB
+                reserved = torch.cuda.memory_reserved(i) / 1024**3  # GB
+                total = torch.cuda.get_device_properties(i).total_memory / 1024**3  # GB
+                print(f"  GPU {i} 内存: {allocated:.2f}GB已分配 / {reserved:.2f}GB已保留 / {total:.2f}GB总计")
+            
+            # 如果GPU内存被占用，尝试清理
+            if torch.cuda.memory_allocated(0) > 0:
+                print(f"  ⚠️  检测到GPU内存被占用，尝试清理...")
+                torch.cuda.empty_cache()
+                allocated_after = torch.cuda.memory_allocated(0) / 1024**3
+                print(f"  清理后GPU 0内存: {allocated_after:.2f}GB")
     
     # 只在主进程打印信息
     if is_main_process:

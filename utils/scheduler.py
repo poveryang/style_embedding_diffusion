@@ -69,23 +69,30 @@ class DiffusionScheduler:
         if noise is None:
             noise = torch.randn_like(x0)
         
-        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod[t].view(-1, 1, 1, 1)
-        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
+        # 确保scheduler的参数与输入数据在同一设备上（支持DataParallel）
+        device = x0.device
+        sqrt_alphas_cumprod = self.sqrt_alphas_cumprod.to(device)
+        sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod.to(device)
+        
+        sqrt_alphas_cumprod_t = sqrt_alphas_cumprod[t].view(-1, 1, 1, 1)
+        sqrt_one_minus_alphas_cumprod_t = sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
         
         xt = sqrt_alphas_cumprod_t * x0 + sqrt_one_minus_alphas_cumprod_t * noise
         return xt
     
-    def sample_timesteps(self, batch_size: int) -> torch.Tensor:
+    def sample_timesteps(self, batch_size: int, device: Optional[torch.device] = None) -> torch.Tensor:
         """
         随机采样时间步
         
         Args:
             batch_size: 批次大小
+            device: 目标设备（如果为None，使用self.device）
             
         Returns:
             t: (batch_size,) 随机时间步
         """
-        return torch.randint(0, self.num_timesteps, (batch_size,), device=self.device)
+        target_device = device if device is not None else self.device
+        return torch.randint(0, self.num_timesteps, (batch_size,), device=target_device)
     
     def step(self, model_output: torch.Tensor, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """
@@ -99,28 +106,35 @@ class DiffusionScheduler:
         Returns:
             prev_x: (B, C, H, W) 去噪后的latent
         """
+        # 确保scheduler的参数与输入数据在同一设备上（支持DataParallel）
+        device = x.device
+        alphas_cumprod = self.alphas_cumprod.to(device)
+        posterior_mean_coef1 = self.posterior_mean_coef1.to(device)
+        posterior_mean_coef2 = self.posterior_mean_coef2.to(device)
+        posterior_variance = self.posterior_variance.to(device)
+        
         # 预测x0
-        sqrt_recip_alphas_cumprod = 1.0 / torch.sqrt(self.alphas_cumprod)
-        sqrt_recipm1_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod - 1)
+        sqrt_recip_alphas_cumprod = 1.0 / torch.sqrt(alphas_cumprod)
+        sqrt_recipm1_alphas_cumprod = torch.sqrt(1.0 / alphas_cumprod - 1)
         
         pred_x0 = (sqrt_recip_alphas_cumprod[t].view(-1, 1, 1, 1) * x -
                    sqrt_recipm1_alphas_cumprod[t].view(-1, 1, 1, 1) * model_output)
         
         # 计算后验均值
         posterior_mean = (
-            self.posterior_mean_coef1[t].view(-1, 1, 1, 1) * pred_x0 +
-            self.posterior_mean_coef2[t].view(-1, 1, 1, 1) * x
+            posterior_mean_coef1[t].view(-1, 1, 1, 1) * pred_x0 +
+            posterior_mean_coef2[t].view(-1, 1, 1, 1) * x
         )
         
         # 计算后验方差
-        posterior_variance = self.posterior_variance[t].view(-1, 1, 1, 1)
+        posterior_var = posterior_variance[t].view(-1, 1, 1, 1)
         
         # 采样
         if t[0] == 0:
             return posterior_mean
         else:
             noise = torch.randn_like(x)
-            return posterior_mean + torch.sqrt(posterior_variance) * noise
+            return posterior_mean + torch.sqrt(posterior_var) * noise
     
     def ddim_step(
         self,
@@ -146,21 +160,26 @@ class DiffusionScheduler:
         if prev_t is None:
             prev_t = t - 1
         
+        # 确保scheduler的参数与输入数据在同一设备上（支持DataParallel）
+        device = x.device
+        alphas_cumprod = self.alphas_cumprod.to(device)
+        posterior_variance = self.posterior_variance.to(device)
+        
         # 预测x0
-        sqrt_recip_alphas_cumprod = 1.0 / torch.sqrt(self.alphas_cumprod)
-        sqrt_recipm1_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod - 1)
+        sqrt_recip_alphas_cumprod = 1.0 / torch.sqrt(alphas_cumprod)
+        sqrt_recipm1_alphas_cumprod = torch.sqrt(1.0 / alphas_cumprod - 1)
         
         pred_x0 = (sqrt_recip_alphas_cumprod[t].view(-1, 1, 1, 1) * x -
                    sqrt_recipm1_alphas_cumprod[t].view(-1, 1, 1, 1) * model_output)
         
         # 计算方向指向xt
-        dir_xt = torch.sqrt(1.0 - self.alphas_cumprod[prev_t].view(-1, 1, 1, 1) - 
-                           eta ** 2 * self.posterior_variance[t].view(-1, 1, 1, 1)) * model_output
+        dir_xt = torch.sqrt(1.0 - alphas_cumprod[prev_t].view(-1, 1, 1, 1) - 
+                           eta ** 2 * posterior_variance[t].view(-1, 1, 1, 1)) * model_output
         
         # 随机噪声
-        noise = eta * torch.sqrt(self.posterior_variance[t].view(-1, 1, 1, 1)) * torch.randn_like(x)
+        noise = eta * torch.sqrt(posterior_variance[t].view(-1, 1, 1, 1)) * torch.randn_like(x)
         
-        prev_x = torch.sqrt(self.alphas_cumprod[prev_t].view(-1, 1, 1, 1)) * pred_x0 + dir_xt + noise
+        prev_x = torch.sqrt(alphas_cumprod[prev_t].view(-1, 1, 1, 1)) * pred_x0 + dir_xt + noise
         
         return prev_x
 

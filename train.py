@@ -1,10 +1,13 @@
 """
 训练脚本：训练基于条件扩散模型的成像风格表征学习系统
+支持DistributedDataParallel (DDP)多GPU训练
 """
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Subset, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 import os
 import argparse
@@ -220,7 +223,9 @@ class StyleEmbeddingDiffusionModel(nn.Module):
         
         # 2. 随机采样扩散步并加噪
         batch_size = I_bin.size(0)
-        t = self.scheduler.sample_timesteps(batch_size)
+        # 确保时间步采样在与数据相同的设备上（支持DataParallel）
+        device = I_bin.device
+        t = self.scheduler.sample_timesteps(batch_size).to(device)
         noise = torch.randn_like(z0)
         z_t = self.scheduler.add_noise(z0, t, noise)
         
@@ -254,7 +259,8 @@ def train_epoch(
     config: Config,
     epoch: int,
     writer: SummaryWriter,
-    scaler: torch.cuda.amp.GradScaler = None
+    scaler: torch.cuda.amp.GradScaler = None,
+    is_main_process: bool = True
 ):
     """训练一个epoch"""
     model.train()
@@ -262,7 +268,8 @@ def train_epoch(
     total_diffusion_loss = 0.0
     total_style_kl_loss = 0.0
     
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    # 只在主进程显示进度条
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=not is_main_process)
     for batch_idx, (I_bin, I_orig) in enumerate(pbar):
         I_bin = I_bin.to(config.device)
         I_orig = I_orig.to(config.device)
@@ -297,13 +304,14 @@ def train_epoch(
             'kl': f"{losses['style_kl_loss'].item() if losses['style_kl_loss'] is not None else 0:.4f}"
         })
         
-        # 记录到tensorboard
-        global_step = epoch * len(dataloader) + batch_idx
-        if batch_idx % config.training.log_interval == 0:
-            writer.add_scalar('train/loss', losses['total_loss'].item(), global_step)
-            writer.add_scalar('train/diffusion_loss', losses['diffusion_loss'].item(), global_step)
-            if losses['style_kl_loss'] is not None:
-                writer.add_scalar('train/style_kl_loss', losses['style_kl_loss'].item(), global_step)
+        # 记录到tensorboard（只在主进程）
+        if is_main_process:
+            global_step = epoch * len(dataloader) + batch_idx
+            if batch_idx % config.training.log_interval == 0 and writer is not None:
+                writer.add_scalar('train/loss', losses['total_loss'].item(), global_step)
+                writer.add_scalar('train/diffusion_loss', losses['diffusion_loss'].item(), global_step)
+                if losses['style_kl_loss'] is not None:
+                    writer.add_scalar('train/style_kl_loss', losses['style_kl_loss'].item(), global_step)
             writer.add_scalar('train/learning_rate', scheduler.get_last_lr()[0], global_step)
     
     avg_loss = total_loss / len(dataloader)
@@ -322,14 +330,18 @@ def validate(
     dataloader: DataLoader,
     config: Config,
     epoch: int,
-    writer: SummaryWriter
+    writer: SummaryWriter,
+    use_ddp: bool = False,
+    is_main_process: bool = True
 ):
     """验证"""
     model.eval()
     total_loss = 0.0
     
     with torch.no_grad():
-        for I_bin, I_orig in tqdm(dataloader, desc="Validating"):
+        # 只在主进程显示进度条
+        pbar = tqdm(dataloader, desc="Validating", disable=not is_main_process)
+        for I_bin, I_orig in pbar:
             I_bin = I_bin.to(config.device)
             I_orig = I_orig.to(config.device)
             
@@ -337,7 +349,17 @@ def validate(
             total_loss += losses['total_loss'].item()
     
     avg_loss = total_loss / len(dataloader)
-    writer.add_scalar('val/loss', avg_loss, epoch)
+    
+    # DDP时聚合所有进程的损失
+    if use_ddp:
+        # 创建tensor用于all_reduce
+        loss_tensor = torch.tensor(avg_loss, device=config.device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        avg_loss = loss_tensor.item() / dist.get_world_size()
+    
+    # 只在主进程记录到tensorboard
+    if is_main_process and writer is not None:
+        writer.add_scalar('val/loss', avg_loss, epoch)
     
     return avg_loss
 
@@ -349,7 +371,47 @@ def main():
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints', help='检查点目录')
     parser.add_argument('--resume', type=str, default=None, help='恢复训练的检查点路径')
     parser.add_argument('--data_ratio', type=float, default=1.0, help='使用数据的比例（0.0-1.0），例如0.01表示使用1%%的数据')
+    
+    # DDP相关参数
+    parser.add_argument('--local_rank', type=int, default=-1, help='本地GPU rank（DDP自动设置）')
+    parser.add_argument('--world_size', type=int, default=-1, help='总进程数（DDP自动设置）')
+    parser.add_argument('--rank', type=int, default=-1, help='全局rank（DDP自动设置）')
+    parser.add_argument('--master_addr', type=str, default='localhost', help='主节点地址')
+    parser.add_argument('--master_port', type=str, default='12355', help='主节点端口')
+    
     args = parser.parse_args()
+    
+    # 初始化分布式训练
+    use_ddp = False
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        # 使用torchrun启动
+        args.rank = int(os.environ['RANK'])
+        args.world_size = int(os.environ['WORLD_SIZE'])
+        args.local_rank = int(os.environ['LOCAL_RANK'])
+        use_ddp = True
+    elif args.local_rank != -1:
+        # 手动设置DDP
+        args.rank = args.rank if args.rank != -1 else args.local_rank
+        args.world_size = args.world_size if args.world_size != -1 else torch.cuda.device_count()
+        use_ddp = True
+    
+    if use_ddp:
+        # 初始化进程组
+        dist.init_process_group(
+            backend='nccl',
+            init_method=f'tcp://{args.master_addr}:{args.master_port}',
+            rank=args.rank,
+            world_size=args.world_size
+        )
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device(f'cuda:{args.local_rank}')
+        is_main_process = (args.rank == 0)
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        is_main_process = True
+        args.rank = 0
+        args.world_size = 1
+        args.local_rank = 0
     
     # 加载配置
     config = Config()
@@ -357,33 +419,43 @@ def main():
         config.training.data_root = args.data_root
     if args.checkpoint_dir:
         config.training.checkpoint_dir = args.checkpoint_dir
+    config.device = str(device)
     
     # 设置随机种子
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
-    
-    # 检查CUDA可用性
-    cuda_available = torch.cuda.is_available()
-    num_gpus = torch.cuda.device_count() if cuda_available else 0
-    
-    if cuda_available:
+    if torch.cuda.is_available():
         torch.cuda.manual_seed_all(config.seed)
-        print(f"✓ CUDA可用: {torch.cuda.get_device_name(0)}")
-        print(f"  CUDA版本: {torch.version.cuda}")
-        print(f"  设备数量: {num_gpus}")
-        if num_gpus > 1:
-            print(f"  将使用 {num_gpus} 张GPU进行训练")
-            print(f"  每张GPU的batch_size: {config.training.batch_size // num_gpus}")
-            print(f"  总有效batch_size: {config.training.batch_size}")
-    else:
-        print("⚠ CUDA不可用，将使用CPU训练（速度较慢）")
-        config.device = "cpu"
     
-    print(f"使用设备: {config.device}")
+    # 只在主进程打印信息
+    if is_main_process:
+        cuda_available = torch.cuda.is_available()
+        num_gpus = args.world_size if use_ddp else (torch.cuda.device_count() if cuda_available else 0)
+        
+        if cuda_available:
+            print(f"✓ CUDA可用: {torch.cuda.get_device_name(args.local_rank)}")
+            print(f"  CUDA版本: {torch.version.cuda}")
+            if use_ddp:
+                print(f"  使用DDP训练")
+                print(f"  总进程数: {args.world_size}")
+                print(f"  当前rank: {args.rank}")
+                print(f"  每张GPU的batch_size: {config.training.batch_size // args.world_size}")
+                print(f"  总有效batch_size: {config.training.batch_size}")
+            else:
+                print(f"  设备数量: {num_gpus}")
+        else:
+            print("⚠ CUDA不可用，将使用CPU训练（速度较慢）")
+        
+        print(f"使用设备: {config.device}")
     
-    # 创建目录
-    os.makedirs(config.training.checkpoint_dir, exist_ok=True)
-    os.makedirs(config.training.log_dir, exist_ok=True)
+    # 创建目录（只在主进程）
+    if is_main_process:
+        os.makedirs(config.training.checkpoint_dir, exist_ok=True)
+        os.makedirs(config.training.log_dir, exist_ok=True)
+    
+    # 同步所有进程
+    if use_ddp:
+        dist.barrier()
     
     # 创建数据集
     train_dataset_full = QRCodeDataset(
@@ -409,53 +481,84 @@ def main():
         train_dataset = Subset(train_dataset_full, train_indices)
         val_dataset = Subset(val_dataset_full, val_indices)
         
-        print(f"⚠️  使用部分数据训练:")
-        print(f"   训练集: {train_size}/{len(train_dataset_full)} ({args.data_ratio*100:.1f}%%)")
-        print(f"   验证集: {val_size}/{len(val_dataset_full)} ({args.data_ratio*100:.1f}%%)")
+        if is_main_process:
+            print(f"⚠️  使用部分数据训练:")
+            print(f"   训练集: {train_size}/{len(train_dataset_full)} ({args.data_ratio*100:.1f}%%)")
+            print(f"   验证集: {val_size}/{len(val_dataset_full)} ({args.data_ratio*100:.1f}%%)")
     else:
         train_dataset = train_dataset_full
         val_dataset = val_dataset_full
-        print(f"使用全部数据:")
-        print(f"   训练集: {len(train_dataset)} 样本")
-        print(f"   验证集: {len(val_dataset)} 样本")
+        if is_main_process:
+            print(f"使用全部数据:")
+            print(f"   训练集: {len(train_dataset)} 样本")
+            print(f"   验证集: {len(val_dataset)} 样本")
     
-    # 多GPU时调整batch_size（必须在DataLoader创建之前）
-    if num_gpus > 1:
-        if config.training.batch_size % num_gpus != 0:
-            old_batch_size = config.training.batch_size
-            config.training.batch_size = (config.training.batch_size // num_gpus) * num_gpus
-            print(f"\n⚠️  警告: batch_size ({old_batch_size}) 不能被GPU数量 ({num_gpus}) 整除")
-            print(f"  已自动调整为: {config.training.batch_size}")
-            print(f"  每张GPU的batch_size: {config.training.batch_size // num_gpus}")
+    # DDP时调整batch_size（每张GPU的batch_size）
+    if use_ddp:
+        per_gpu_batch_size = config.training.batch_size // args.world_size
+        if config.training.batch_size % args.world_size != 0:
+            if is_main_process:
+                old_batch_size = config.training.batch_size
+                per_gpu_batch_size = config.training.batch_size // args.world_size
+                print(f"\n⚠️  警告: batch_size ({old_batch_size}) 不能被GPU数量 ({args.world_size}) 整除")
+                print(f"  每张GPU的batch_size: {per_gpu_batch_size}")
+                print(f"  总有效batch_size: {per_gpu_batch_size * args.world_size}")
+        per_gpu_batch_size = config.training.batch_size // args.world_size
+    else:
+        per_gpu_batch_size = config.training.batch_size
+    
+    # 创建DistributedSampler（DDP时使用）
+    if use_ddp:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=args.world_size,
+            rank=args.rank,
+            shuffle=True,
+            seed=config.seed
+        )
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=args.world_size,
+            rank=args.rank,
+            shuffle=False
+        )
+        shuffle = False  # DistributedSampler已经处理shuffle
+    else:
+        train_sampler = None
+        val_sampler = None
+        shuffle = True
     
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=True,
-        num_workers=8,  # 增加数据加载进程数
+        batch_size=per_gpu_batch_size,
+        shuffle=shuffle,
+        sampler=train_sampler,
+        num_workers=4,  # DDP时减少worker数量
         pin_memory=True,
-        persistent_workers=True,  # 保持worker进程，避免重复创建
-        prefetch_factor=2  # 预取更多数据
+        persistent_workers=True,
+        prefetch_factor=2
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config.training.batch_size,
+        batch_size=per_gpu_batch_size,
         shuffle=False,
-        num_workers=8,
+        sampler=val_sampler,
+        num_workers=4,
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=2
     )
     
     # 创建模型
-    model = StyleEmbeddingDiffusionModel(config).to(config.device)
+    model = StyleEmbeddingDiffusionModel(config).to(device)
     
-    # 多GPU支持
-    if num_gpus > 1:
-        print(f"\n使用DataParallel在 {num_gpus} 张GPU上训练")
-        model = nn.DataParallel(model)
-        print(f"  总有效batch_size: {config.training.batch_size}")
-        print(f"  每张GPU的batch_size: {config.training.batch_size // num_gpus}")
+    # DDP包装模型
+    if use_ddp:
+        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=False)
+        if is_main_process:
+            print(f"\n✓ 使用DDP在 {args.world_size} 张GPU上训练")
+            print(f"  每张GPU的batch_size: {per_gpu_batch_size}")
+            print(f"  总有效batch_size: {per_gpu_batch_size * args.world_size}")
     
     # 创建优化器和调度器
     optimizer = optim.AdamW(
@@ -475,46 +578,62 @@ def main():
     if config.training.use_amp and not use_amp:
         print(f"警告: 混合精度训练已请求，但CUDA不可用。已禁用AMP。")
     
-    # TensorBoard
-    writer = SummaryWriter(config.training.log_dir)
+    # TensorBoard（只在主进程）
+    writer = SummaryWriter(config.training.log_dir) if is_main_process else None
     
     # 恢复训练
     start_epoch = 0
     if args.resume:
-        checkpoint = torch.load(args.resume)
+        # 加载checkpoint（所有进程都需要加载模型状态）
+        checkpoint = torch.load(args.resume, map_location=device)
         state_dict = checkpoint['model_state_dict']
-        # 处理DataParallel的情况：如果当前是DataParallel但checkpoint不是，需要添加module前缀
-        # 或者如果当前不是DataParallel但checkpoint是，需要移除module前缀
-        if isinstance(model, nn.DataParallel):
-            # 如果checkpoint的key没有module前缀，需要添加
-            if not any(k.startswith('module.') for k in state_dict.keys()):
-                state_dict = {f'module.{k}': v for k, v in state_dict.items()}
-        else:
-            # 如果checkpoint的key有module前缀，需要移除
+        # 处理DDP的情况：移除module前缀（如果checkpoint是DDP保存的）
+        if use_ddp:
             if any(k.startswith('module.') for k in state_dict.keys()):
                 state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-        model.load_state_dict(state_dict)
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        print(f"从epoch {start_epoch}恢复训练")
+        # 加载模型状态
+        if isinstance(model, DDP):
+            model.module.load_state_dict(state_dict)
+        else:
+            model.load_state_dict(state_dict)
+        
+        # 只在主进程加载优化器和调度器状态
+        if is_main_process:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            print(f"从epoch {start_epoch}恢复训练")
+        
+        # 同步所有进程
+        if use_ddp:
+            dist.barrier()
+            # 广播start_epoch到所有进程
+            start_epoch_tensor = torch.tensor([start_epoch], device=device)
+            dist.broadcast(start_epoch_tensor, src=0)
+            start_epoch = start_epoch_tensor.item()
     
     # 训练循环
     best_val_loss = float('inf')
     for epoch in range(start_epoch, config.training.num_epochs):
+        # DDP时设置sampler的epoch（确保每个epoch的数据顺序不同）
+        if use_ddp:
+            train_sampler.set_epoch(epoch)
+        
         # 训练
         train_metrics = train_epoch(
             model, train_loader, optimizer, scheduler,
-            config, epoch, writer, scaler
+            config, epoch, writer, scaler, is_main_process
         )
         
         # 验证
-        val_loss = validate(model, val_loader, config, epoch, writer)
+        val_loss = validate(model, val_loader, config, epoch, writer, use_ddp, is_main_process)
         
-        print(f"Epoch {epoch}: train_loss={train_metrics['loss']:.4f}, val_loss={val_loss:.4f}")
+        # 只在主进程打印
+        if is_main_process:
+            print(f"Epoch {epoch}: train_loss={train_metrics['loss']:.4f}, val_loss={val_loss:.4f}")
         
-        # 生成并保存样本图像（方便监控训练进度）
-        if config.training.save_samples and (epoch + 1) % config.training.sample_interval == 0:
+        # 生成并保存样本图像（方便监控训练进度，只在主进程）
+        if is_main_process and config.training.save_samples and (epoch + 1) % config.training.sample_interval == 0:
             sample_output_dir = os.path.join(config.training.checkpoint_dir, 'samples')
             save_sample_images(
                 model, val_loader, epoch, sample_output_dir,
@@ -524,14 +643,17 @@ def main():
             )
             print(f"保存样本图像到: {sample_output_dir}")
         
-        # 保存检查点
-        if (epoch + 1) % config.training.save_interval == 0:
+        # 保存检查点（只在主进程）
+        if is_main_process and (epoch + 1) % config.training.save_interval == 0:
             checkpoint_path = os.path.join(
                 config.training.checkpoint_dir,
                 f'checkpoint_epoch_{epoch+1}.pth'
             )
-            # 保存模型状态：如果是DataParallel，保存model.module.state_dict()以便单GPU加载
-            model_state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+            # 保存模型状态：DDP或DataParallel时，保存model.module.state_dict()以便单GPU加载
+            if isinstance(model, (DDP, nn.DataParallel)):
+                model_state_dict = model.module.state_dict()
+            else:
+                model_state_dict = model.state_dict()
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model_state_dict,
@@ -541,12 +663,15 @@ def main():
             }, checkpoint_path)
             print(f"保存检查点: {checkpoint_path}")
         
-        # 保存最佳模型
-        if val_loss < best_val_loss:
+        # 保存最佳模型（只在主进程）
+        if is_main_process and val_loss < best_val_loss:
             best_val_loss = val_loss
             best_path = os.path.join(config.training.checkpoint_dir, 'best_model.pth')
-            # 保存模型状态：如果是DataParallel，保存model.module.state_dict()以便单GPU加载
-            model_state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+            # 保存模型状态：DDP或DataParallel时，保存model.module.state_dict()以便单GPU加载
+            if isinstance(model, (DDP, nn.DataParallel)):
+                model_state_dict = model.module.state_dict()
+            else:
+                model_state_dict = model.state_dict()
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model_state_dict,
@@ -554,8 +679,15 @@ def main():
             }, best_path)
             print(f"保存最佳模型: {best_path}")
     
-    writer.close()
-    print("训练完成！")
+    # 清理
+    if is_main_process:
+        if writer is not None:
+            writer.close()
+        print("训练完成！")
+    
+    # 清理分布式进程组
+    if use_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':

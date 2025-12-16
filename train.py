@@ -364,11 +364,17 @@ def main():
     
     # 检查CUDA可用性
     cuda_available = torch.cuda.is_available()
+    num_gpus = torch.cuda.device_count() if cuda_available else 0
+    
     if cuda_available:
         torch.cuda.manual_seed_all(config.seed)
         print(f"✓ CUDA可用: {torch.cuda.get_device_name(0)}")
         print(f"  CUDA版本: {torch.version.cuda}")
-        print(f"  设备数量: {torch.cuda.device_count()}")
+        print(f"  设备数量: {num_gpus}")
+        if num_gpus > 1:
+            print(f"  将使用 {num_gpus} 张GPU进行训练")
+            print(f"  每张GPU的batch_size: {config.training.batch_size // num_gpus}")
+            print(f"  总有效batch_size: {config.training.batch_size}")
     else:
         print("⚠ CUDA不可用，将使用CPU训练（速度较慢）")
         config.device = "cpu"
@@ -413,6 +419,15 @@ def main():
         print(f"   训练集: {len(train_dataset)} 样本")
         print(f"   验证集: {len(val_dataset)} 样本")
     
+    # 多GPU时调整batch_size（必须在DataLoader创建之前）
+    if num_gpus > 1:
+        if config.training.batch_size % num_gpus != 0:
+            old_batch_size = config.training.batch_size
+            config.training.batch_size = (config.training.batch_size // num_gpus) * num_gpus
+            print(f"\n⚠️  警告: batch_size ({old_batch_size}) 不能被GPU数量 ({num_gpus}) 整除")
+            print(f"  已自动调整为: {config.training.batch_size}")
+            print(f"  每张GPU的batch_size: {config.training.batch_size // num_gpus}")
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.training.batch_size,
@@ -434,6 +449,13 @@ def main():
     
     # 创建模型
     model = StyleEmbeddingDiffusionModel(config).to(config.device)
+    
+    # 多GPU支持
+    if num_gpus > 1:
+        print(f"\n使用DataParallel在 {num_gpus} 张GPU上训练")
+        model = nn.DataParallel(model)
+        print(f"  总有效batch_size: {config.training.batch_size}")
+        print(f"  每张GPU的batch_size: {config.training.batch_size // num_gpus}")
     
     # 创建优化器和调度器
     optimizer = optim.AdamW(
@@ -460,7 +482,18 @@ def main():
     start_epoch = 0
     if args.resume:
         checkpoint = torch.load(args.resume)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        state_dict = checkpoint['model_state_dict']
+        # 处理DataParallel的情况：如果当前是DataParallel但checkpoint不是，需要添加module前缀
+        # 或者如果当前不是DataParallel但checkpoint是，需要移除module前缀
+        if isinstance(model, nn.DataParallel):
+            # 如果checkpoint的key没有module前缀，需要添加
+            if not any(k.startswith('module.') for k in state_dict.keys()):
+                state_dict = {f'module.{k}': v for k, v in state_dict.items()}
+        else:
+            # 如果checkpoint的key有module前缀，需要移除
+            if any(k.startswith('module.') for k in state_dict.keys()):
+                state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
@@ -497,9 +530,11 @@ def main():
                 config.training.checkpoint_dir,
                 f'checkpoint_epoch_{epoch+1}.pth'
             )
+            # 保存模型状态：如果是DataParallel，保存model.module.state_dict()以便单GPU加载
+            model_state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': model_state_dict,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'val_loss': val_loss,
@@ -510,9 +545,11 @@ def main():
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_path = os.path.join(config.training.checkpoint_dir, 'best_model.pth')
+            # 保存模型状态：如果是DataParallel，保存model.module.state_dict()以便单GPU加载
+            model_state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': model_state_dict,
                 'val_loss': val_loss,
             }, best_path)
             print(f"保存最佳模型: {best_path}")

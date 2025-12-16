@@ -47,7 +47,7 @@ class ModelConfig:
 @dataclass
 class TrainingConfig:
     """训练配置"""
-    batch_size: int = 4  # 减小batch size以加快训练速度（模型较大，batch_size=8时每个batch约51秒）
+    batch_size: int = 32  # 总batch_size，多GPU时会自动分配到各GPU（例如8张GPU时每张处理batch_size/8）
     learning_rate: float = 1e-4
     num_epochs: int = 100
     save_interval: int = 10

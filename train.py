@@ -389,11 +389,16 @@ def main():
         args.world_size = int(os.environ['WORLD_SIZE'])
         args.local_rank = int(os.environ['LOCAL_RANK'])
         use_ddp = True
+        print(f"[DEBUG] 检测到torchrun环境变量: RANK={args.rank}, WORLD_SIZE={args.world_size}, LOCAL_RANK={args.local_rank}")
     elif args.local_rank != -1:
         # 手动设置DDP
         args.rank = args.rank if args.rank != -1 else args.local_rank
         args.world_size = args.world_size if args.world_size != -1 else torch.cuda.device_count()
         use_ddp = True
+        print(f"[DEBUG] 手动设置DDP: rank={args.rank}, world_size={args.world_size}, local_rank={args.local_rank}")
+    else:
+        print(f"[DEBUG] 未检测到DDP环境变量，将使用单GPU训练")
+        print(f"[DEBUG] 要使用DDP，请使用: torchrun --nproc_per_node=4 train.py ...")
     
     if use_ddp:
         # 初始化进程组
@@ -504,6 +509,18 @@ def main():
                 print(f"  每张GPU的batch_size: {per_gpu_batch_size}")
                 print(f"  总有效batch_size: {per_gpu_batch_size * args.world_size}")
         per_gpu_batch_size = config.training.batch_size // args.world_size
+        
+        # 检查每张GPU的batch_size是否太小
+        if per_gpu_batch_size < 1:
+            if is_main_process:
+                print(f"\n❌ 错误: 每张GPU的batch_size ({per_gpu_batch_size}) 太小！")
+                print(f"  总batch_size ({config.training.batch_size}) 必须 >= GPU数量 ({args.world_size})")
+                print(f"  建议: 将batch_size设置为至少 {args.world_size} 或更大")
+            raise ValueError(f"batch_size ({config.training.batch_size}) 太小，无法分配给 {args.world_size} 张GPU")
+        
+        if per_gpu_batch_size == 1 and is_main_process:
+            print(f"\n⚠️  警告: 每张GPU的batch_size=1，这可能导致训练不稳定或效率低下")
+            print(f"  建议: 将batch_size设置为至少 {args.world_size * 2} 或更大")
     else:
         per_gpu_batch_size = config.training.batch_size
     

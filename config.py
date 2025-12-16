@@ -47,7 +47,8 @@ class ModelConfig:
 @dataclass
 class TrainingConfig:
     """训练配置"""
-    batch_size: int = 32  # 总batch_size，多GPU时会自动分配到各GPU（例如8张GPU时每张处理batch_size/8）
+    batch_size: int = 32  # 总batch_size（所有GPU的总和），DDP时会自动分配到各GPU
+                          # 例如：batch_size=32, 4张GPU → 每张GPU处理8个样本，总有效batch_size=32
     learning_rate: float = 1e-4
     num_epochs: int = 100
     save_interval: int = 10

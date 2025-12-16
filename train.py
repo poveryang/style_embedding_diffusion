@@ -15,6 +15,7 @@ from tqdm import tqdm
 import numpy as np
 from PIL import Image
 import torchvision.transforms as transforms
+import datetime
 
 from config import Config
 from models import ContentEncoder, StyleEncoder, VAE, ConditionalUNet
@@ -397,8 +398,14 @@ def main():
         elif args.local_rank == -1:
             # 如果没有LOCAL_RANK环境变量，尝试从RANK推断（单节点情况）
             args.local_rank = args.rank
-        use_ddp = True
-        print(f"[DEBUG] 检测到DDP环境变量: RANK={args.rank}, WORLD_SIZE={args.world_size}, LOCAL_RANK={args.local_rank}")
+        
+        # 如果WORLD_SIZE=1，说明只启动了1个进程，不需要DDP
+        if args.world_size == 1:
+            print(f"[DEBUG] 检测到DDP环境变量但WORLD_SIZE=1，禁用DDP，使用单GPU训练")
+            use_ddp = False
+        else:
+            use_ddp = True
+            print(f"[DEBUG] 检测到DDP环境变量: RANK={args.rank}, WORLD_SIZE={args.world_size}, LOCAL_RANK={args.local_rank}")
     elif args.local_rank != -1:
         # 手动设置DDP
         args.rank = args.rank if args.rank != -1 else args.local_rank
@@ -418,15 +425,31 @@ def main():
     
     if use_ddp:
         # 初始化进程组
-        dist.init_process_group(
-            backend='nccl',
-            init_method=f'tcp://{args.master_addr}:{args.master_port}',
-            rank=args.rank,
-            world_size=args.world_size
-        )
-        torch.cuda.set_device(args.local_rank)
-        device = torch.device(f'cuda:{args.local_rank}')
-        is_main_process = (args.rank == 0)
+        try:
+            print(f"[DEBUG] 正在初始化DDP进程组...")
+            print(f"  backend=nccl, rank={args.rank}, world_size={args.world_size}")
+            print(f"  master_addr={args.master_addr}, master_port={args.master_port}")
+            
+            dist.init_process_group(
+                backend='nccl',
+                init_method=f'tcp://{args.master_addr}:{args.master_port}',
+                rank=args.rank,
+                world_size=args.world_size,
+                timeout=datetime.timedelta(seconds=1800)  # 30分钟超时
+            )
+            torch.cuda.set_device(args.local_rank)
+            device = torch.device(f'cuda:{args.local_rank}')
+            is_main_process = (args.rank == 0)
+            print(f"[DEBUG] ✓ DDP进程组初始化成功")
+        except Exception as e:
+            print(f"[ERROR] DDP初始化失败: {e}")
+            print(f"回退到单GPU训练")
+            use_ddp = False
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            is_main_process = True
+            args.rank = 0
+            args.world_size = 1
+            args.local_rank = 0
     else:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         is_main_process = True

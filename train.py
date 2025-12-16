@@ -269,8 +269,8 @@ def train_epoch(
         
         optimizer.zero_grad()
         
-        # 混合精度训练
-        if config.training.use_amp and scaler is not None:
+        # 混合精度训练（仅在CUDA可用时使用）
+        if scaler is not None and torch.cuda.is_available():
             with torch.cuda.amp.autocast():
                 losses = model(I_bin, I_orig)
             
@@ -361,8 +361,19 @@ def main():
     # 设置随机种子
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
-    if torch.cuda.is_available():
+    
+    # 检查CUDA可用性
+    cuda_available = torch.cuda.is_available()
+    if cuda_available:
         torch.cuda.manual_seed_all(config.seed)
+        print(f"✓ CUDA可用: {torch.cuda.get_device_name(0)}")
+        print(f"  CUDA版本: {torch.version.cuda}")
+        print(f"  设备数量: {torch.cuda.device_count()}")
+    else:
+        print("⚠ CUDA不可用，将使用CPU训练（速度较慢）")
+        config.device = "cpu"
+    
+    print(f"使用设备: {config.device}")
     
     # 创建目录
     os.makedirs(config.training.checkpoint_dir, exist_ok=True)
@@ -436,8 +447,11 @@ def main():
         lr_lambda=lambda step: min(step / config.training.warmup_steps, 1.0)
     )
     
-    # 混合精度
-    scaler = torch.cuda.amp.GradScaler() if config.training.use_amp else None
+    # 混合精度（仅在CUDA可用时启用）
+    use_amp = config.training.use_amp and torch.cuda.is_available() and config.device == "cuda"
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    if config.training.use_amp and not use_amp:
+        print(f"警告: 混合精度训练已请求，但CUDA不可用。已禁用AMP。")
     
     # TensorBoard
     writer = SummaryWriter(config.training.log_dir)

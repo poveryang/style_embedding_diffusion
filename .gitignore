@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# PyTorch
+*.pth
+*.pt
+*.ckpt
+
+# Data
+data/
+*.png
+*.jpg
+*.jpeg
+*.npy
+*.npz
+
+# Logs and outputs
+logs/
+checkpoints/
+outputs/
+*.log
+*.csv
+
+# TensorBoard
+runs/
+events.out.tfevents.*
+
+# OS
+.DS_Store
+Thumbs.db
+*.com.apple.provenance
+
+# Project specific
+style_space_*.png
+*.pth.tar
+

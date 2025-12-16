@@ -373,11 +373,12 @@ def main():
     parser.add_argument('--data_ratio', type=float, default=1.0, help='使用数据的比例（0.0-1.0），例如0.01表示使用1%%的数据')
     
     # DDP相关参数
-    parser.add_argument('--local_rank', type=int, default=-1, help='本地GPU rank（DDP自动设置）')
+    # 兼容 --local-rank 和 --local_rank 两种格式（torch.distributed.launch使用--local-rank）
+    parser.add_argument('--local-rank', '--local_rank', type=int, default=-1, dest='local_rank', help='本地GPU rank（DDP自动设置）')
     parser.add_argument('--world_size', type=int, default=-1, help='总进程数（DDP自动设置）')
     parser.add_argument('--rank', type=int, default=-1, help='全局rank（DDP自动设置）')
-    parser.add_argument('--master_addr', type=str, default='localhost', help='主节点地址')
-    parser.add_argument('--master_port', type=str, default='12355', help='主节点端口')
+    parser.add_argument('--master_addr', '--master-addr', type=str, default='localhost', dest='master_addr', help='主节点地址')
+    parser.add_argument('--master_port', '--master-port', type=str, default='12355', dest='master_port', help='主节点端口')
     
     args = parser.parse_args()
     
@@ -385,13 +386,19 @@ def main():
     use_ddp = False
     num_available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     
+    # 检查环境变量（torchrun和torch.distributed.launch都会设置）
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        # 使用torchrun启动（推荐方式）
+        # 使用torchrun或torch.distributed.launch启动
         args.rank = int(os.environ['RANK'])
         args.world_size = int(os.environ['WORLD_SIZE'])
-        args.local_rank = int(os.environ['LOCAL_RANK'])
+        # LOCAL_RANK可能不存在（torch.distributed.launch使用--local-rank参数）
+        if 'LOCAL_RANK' in os.environ:
+            args.local_rank = int(os.environ['LOCAL_RANK'])
+        elif args.local_rank == -1:
+            # 如果没有LOCAL_RANK环境变量，尝试从RANK推断（单节点情况）
+            args.local_rank = args.rank
         use_ddp = True
-        print(f"[DEBUG] 检测到torchrun环境变量: RANK={args.rank}, WORLD_SIZE={args.world_size}, LOCAL_RANK={args.local_rank}")
+        print(f"[DEBUG] 检测到DDP环境变量: RANK={args.rank}, WORLD_SIZE={args.world_size}, LOCAL_RANK={args.local_rank}")
     elif args.local_rank != -1:
         # 手动设置DDP
         args.rank = args.rank if args.rank != -1 else args.local_rank

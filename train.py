@@ -373,13 +373,21 @@ def main():
     parser.add_argument('--resume', type=str, default=None, help='恢复训练的检查点路径')
     parser.add_argument('--data_ratio', type=float, default=1.0, help='使用数据的比例（0.0-1.0），例如0.01表示使用1%%的数据')
     
-    # DDP相关参数
+    # DDP相关参数（torchrun会自动设置这些环境变量，通常不需要手动指定）
     # 兼容 --local-rank 和 --local_rank 两种格式（torch.distributed.launch使用--local-rank）
-    parser.add_argument('--local-rank', '--local_rank', type=int, default=-1, dest='local_rank', help='本地GPU rank（DDP自动设置）')
-    parser.add_argument('--world_size', type=int, default=-1, help='总进程数（DDP自动设置）')
-    parser.add_argument('--rank', type=int, default=-1, help='全局rank（DDP自动设置）')
-    parser.add_argument('--master_addr', '--master-addr', type=str, default='localhost', dest='master_addr', help='主节点地址')
-    parser.add_argument('--master_port', '--master-port', type=str, default='12355', dest='master_port', help='主节点端口')
+    parser.add_argument('--local-rank', '--local_rank', type=int, default=-1, dest='local_rank', 
+                       help='本地GPU rank（torchrun自动设置，通常不需要手动指定）')
+    parser.add_argument('--world_size', type=int, default=-1, 
+                       help='总进程数（torchrun自动设置，通常不需要手动指定）')
+    parser.add_argument('--rank', type=int, default=-1, 
+                       help='全局rank（torchrun自动设置，通常不需要手动指定）')
+    # MASTER_ADDR和MASTER_PORT：torchrun会自动设置，只有在特殊情况下才需要手动指定
+    parser.add_argument('--master_addr', '--master-addr', type=str, 
+                       default=None, dest='master_addr', 
+                       help='主节点地址（torchrun自动设置，通常不需要手动指定）')
+    parser.add_argument('--master_port', '--master-port', type=str, 
+                       default=None, dest='master_port', 
+                       help='主节点端口（torchrun自动设置，通常不需要手动指定）')
     
     args = parser.parse_args()
     
@@ -426,13 +434,19 @@ def main():
     if use_ddp:
         # 初始化进程组
         try:
+            # 优先使用环境变量（torchrun会自动设置），如果没有则使用命令行参数
+            master_addr = os.environ.get('MASTER_ADDR') or args.master_addr or 'localhost'
+            master_port = os.environ.get('MASTER_PORT') or args.master_port or '12355'
+            
             print(f"[DEBUG] 正在初始化DDP进程组...")
             print(f"  backend=nccl, rank={args.rank}, world_size={args.world_size}")
-            print(f"  master_addr={args.master_addr}, master_port={args.master_port}")
+            print(f"  master_addr={master_addr}, master_port={master_port}")
+            if 'MASTER_ADDR' in os.environ or 'MASTER_PORT' in os.environ:
+                print(f"  (使用torchrun设置的环境变量)")
             
             dist.init_process_group(
                 backend='nccl',
-                init_method=f'tcp://{args.master_addr}:{args.master_port}',
+                init_method=f'tcp://{master_addr}:{master_port}',
                 rank=args.rank,
                 world_size=args.world_size,
                 timeout=datetime.timedelta(seconds=1800)  # 30分钟超时

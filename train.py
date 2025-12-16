@@ -639,7 +639,8 @@ def main():
     
     # DDP包装模型
     if use_ddp:
-        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=False)
+        # 启用find_unused_parameters=True，因为某些参数可能在某些条件下不参与loss计算
+        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
         if is_main_process:
             print(f"\n✓ 使用DDP在 {args.world_size} 张GPU上训练")
             print(f"  每张GPU的batch_size: {per_gpu_batch_size}")
@@ -658,10 +659,17 @@ def main():
     )
     
     # 混合精度（仅在CUDA可用时启用）
-    use_amp = config.training.use_amp and torch.cuda.is_available() and config.device == "cuda"
+    # 检查device是否为CUDA设备
+    is_cuda_device = torch.cuda.is_available() and (
+        str(device).startswith('cuda') or 
+        (hasattr(device, 'type') and device.type == 'cuda')
+    )
+    use_amp = config.training.use_amp and is_cuda_device
     scaler = torch.cuda.amp.GradScaler() if use_amp else None
-    if config.training.use_amp and not use_amp:
+    if config.training.use_amp and not use_amp and is_main_process:
         print(f"警告: 混合精度训练已请求，但CUDA不可用。已禁用AMP。")
+    elif use_amp and is_main_process:
+        print(f"✓ 混合精度训练已启用")
     
     # TensorBoard（只在主进程）
     writer = SummaryWriter(config.training.log_dir) if is_main_process else None

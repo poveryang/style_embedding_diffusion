@@ -87,7 +87,7 @@ def save_sample_images(
 
 
 def generate_image(
-    model,  # StyleEmbeddingDiffusionModel (定义在后面)
+    model,  # StyleEmbeddingDiffusionModel (定义在后面) 或 DDP包装的模型
     I_bin: torch.Tensor,
     I_style_ref: torch.Tensor,
     num_inference_steps: int = 50,
@@ -97,7 +97,7 @@ def generate_image(
     生成图像（简化版，用于训练过程中的可视化）
     
     Args:
-        model: 模型
+        model: 模型（可能是DDP包装的）
         I_bin: (1, 1, H, W) 二值二维码图像
         I_style_ref: (1, 1, H, W) 风格参考图像
         num_inference_steps: 推理步数
@@ -106,23 +106,29 @@ def generate_image(
     Returns:
         I_gen: (1, 1, H, W) 生成的图像
     """
+    # 处理DDP包装的模型：通过model.module访问原始模型
+    if isinstance(model, DDP):
+        actual_model = model.module
+    else:
+        actual_model = model
+    
     # 1. 提取风格表征
-    z_style = model.style_encoder.encode(I_style_ref)
+    z_style = actual_model.style_encoder.encode(I_style_ref)
     
     # 2. 编码内容结构
-    F_content = model.content_encoder(I_bin)
+    F_content = actual_model.content_encoder(I_bin)
     
     # 3. 从纯噪声开始条件扩散采样
     z_T = torch.randn(
-        (1, model.config.model.vae_latent_channels,
-         I_bin.shape[2] // model.config.model.vae_scale_factor,
-         I_bin.shape[3] // model.config.model.vae_scale_factor),
+        (1, actual_model.config.model.vae_latent_channels,
+         I_bin.shape[2] // actual_model.config.model.vae_scale_factor,
+         I_bin.shape[3] // actual_model.config.model.vae_scale_factor),
         device=I_bin.device
     )
     
     # 时间步序列
     timesteps = torch.linspace(
-        model.scheduler.num_timesteps - 1, 0, num_inference_steps,
+        actual_model.scheduler.num_timesteps - 1, 0, num_inference_steps,
         device=I_bin.device
     ).long()
     
@@ -130,18 +136,18 @@ def generate_image(
     for i, t in enumerate(timesteps):
         t_batch = t.unsqueeze(0)
         
-        # 预测噪声
-        eps_pred = model.unet(z_t, t_batch, content_features=F_content, style_emb=z_style)
+        # 预测噪声（推理时不需要DDP同步，使用原始模型）
+        eps_pred = actual_model.unet(z_t, t_batch, content_features=F_content, style_emb=z_style)
         
         # 去噪步骤
         if use_ddim:
             prev_t = timesteps[i + 1] if i < len(timesteps) - 1 else torch.tensor(0, device=I_bin.device)
-            z_t = model.scheduler.ddim_step(eps_pred, t_batch, z_t, eta=0.0, prev_t=prev_t.unsqueeze(0))
+            z_t = actual_model.scheduler.ddim_step(eps_pred, t_batch, z_t, eta=0.0, prev_t=prev_t.unsqueeze(0))
         else:
-            z_t = model.scheduler.step(eps_pred, t_batch, z_t)
+            z_t = actual_model.scheduler.step(eps_pred, t_batch, z_t)
     
     # 4. 解码生成图像
-    I_gen = model.vae.decode(z_t)
+    I_gen = actual_model.vae.decode(z_t)
     
     return I_gen
 

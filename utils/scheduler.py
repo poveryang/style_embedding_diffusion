@@ -94,6 +94,32 @@ class DiffusionScheduler:
         target_device = device if device is not None else self.device
         return torch.randint(0, self.num_timesteps, (batch_size,), device=target_device)
     
+    def predict_x0_from_noise(self, noise_pred: torch.Tensor, t: torch.Tensor, x_t: torch.Tensor) -> torch.Tensor:
+        """
+        从预测的噪声和加噪的latent预测原始x0
+        
+        Args:
+            noise_pred: (B, C, H, W) 模型预测的噪声
+            t: (B,) 当前时间步
+            x_t: (B, C, H, W) 加噪后的latent
+            
+        Returns:
+            pred_x0: (B, C, H, W) 预测的原始latent
+        """
+        device = x_t.device
+        alphas_cumprod = self.alphas_cumprod.to(device)
+        
+        # 标准公式: z_0 = (z_t - sqrt(1-alpha_t) * eps) / sqrt(alpha_t)
+        # 等价形式: z_0 = (1/sqrt(alpha_t)) * z_t - (sqrt(1-alpha_t)/sqrt(alpha_t)) * eps
+        # 其中: sqrt(1/alpha_t - 1) = sqrt((1-alpha_t)/alpha_t) = sqrt(1-alpha_t)/sqrt(alpha_t)
+        sqrt_recip_alphas_cumprod = 1.0 / torch.sqrt(alphas_cumprod)  # = 1/sqrt(alpha_t)
+        sqrt_recipm1_alphas_cumprod = torch.sqrt(1.0 / alphas_cumprod - 1)  # = sqrt(1-alpha_t)/sqrt(alpha_t)
+        
+        pred_x0 = (sqrt_recip_alphas_cumprod[t].view(-1, 1, 1, 1) * x_t -
+                   sqrt_recipm1_alphas_cumprod[t].view(-1, 1, 1, 1) * noise_pred)
+        
+        return pred_x0
+    
     def step(self, model_output: torch.Tensor, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """
         DDPM采样步骤
@@ -114,11 +140,7 @@ class DiffusionScheduler:
         posterior_variance = self.posterior_variance.to(device)
         
         # 预测x0
-        sqrt_recip_alphas_cumprod = 1.0 / torch.sqrt(alphas_cumprod)
-        sqrt_recipm1_alphas_cumprod = torch.sqrt(1.0 / alphas_cumprod - 1)
-        
-        pred_x0 = (sqrt_recip_alphas_cumprod[t].view(-1, 1, 1, 1) * x -
-                   sqrt_recipm1_alphas_cumprod[t].view(-1, 1, 1, 1) * model_output)
+        pred_x0 = self.predict_x0_from_noise(model_output, t, x)
         
         # 计算后验均值
         posterior_mean = (

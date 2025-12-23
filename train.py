@@ -181,7 +181,8 @@ class StyleEmbeddingDiffusionModel(nn.Module):
             in_channels=model_cfg.vae_in_channels,
             out_channels=model_cfg.vae_out_channels,
             latent_channels=model_cfg.vae_latent_channels,
-            scale_factor=model_cfg.vae_scale_factor
+            scale_factor=model_cfg.vae_scale_factor,
+            kl_weight=model_cfg.vae_kl_weight
         )
         
         # 获取内容编码器的输出维度
@@ -225,8 +226,12 @@ class StyleEmbeddingDiffusionModel(nn.Module):
         Returns:
             losses: 损失字典
         """
-        # 1. VAE编码真实图像到latent空间
-        z0 = self.vae.encode(I_orig)
+        # 1. VAE编码-解码：获取重建图像、latent和KL损失
+        # 使用forward方法以获取重建损失和KL损失，确保解码器被训练
+        x_recon, z0, vae_kl_loss = self.vae(I_orig)
+        
+        # 计算VAE重建损失（L1损失，对图像重建更稳定）
+        vae_recon_loss = nn.functional.l1_loss(x_recon, I_orig)
         
         # 2. 随机采样扩散步并加噪
         batch_size = I_bin.size(0)
@@ -243,18 +248,34 @@ class StyleEmbeddingDiffusionModel(nn.Module):
         # 4. 条件扩散预测噪声
         eps_pred = self.unet(z_t, t, content_features=F_content, style_emb=z_style)
         
-        # 5. 计算扩散损失
+        # 5. 计算扩散损失（噪声预测损失）
         diffusion_loss = nn.functional.mse_loss(eps_pred, noise)
         
-        # 总损失
+        # 6. 可选的扩散模型图像重建损失
+        diffusion_recon_loss = torch.tensor(0.0, device=device)
+        if self.config.model.diffusion_recon_weight > 0:
+            # 从预测的噪声推理出z0
+            z0_pred = self.scheduler.predict_x0_from_noise(eps_pred, t, z_t)
+            # 解码生成图像
+            I_recon_diff = self.vae.decode(z0_pred)
+            # 计算重建损失
+            diffusion_recon_loss = nn.functional.l1_loss(I_recon_diff, I_orig)
+        
+        # 总损失：扩散损失 + VAE重建损失 + VAE KL损失 + 风格KL损失 + 扩散重建损失
         total_loss = diffusion_loss
+        total_loss = total_loss + self.config.model.vae_recon_weight * vae_recon_loss
+        total_loss = total_loss + vae_kl_loss
         if style_kl_loss is not None:
             total_loss = total_loss + style_kl_loss
+        total_loss = total_loss + self.config.model.diffusion_recon_weight * diffusion_recon_loss
         
         return {
             'total_loss': total_loss,
             'diffusion_loss': diffusion_loss,
+            'vae_recon_loss': vae_recon_loss,
+            'vae_kl_loss': vae_kl_loss,
             'style_kl_loss': style_kl_loss if style_kl_loss is not None else torch.tensor(0.0),
+            'diffusion_recon_loss': diffusion_recon_loss,
         }
 
 
@@ -273,7 +294,10 @@ def train_epoch(
     model.train()
     total_loss = 0.0
     total_diffusion_loss = 0.0
+    total_vae_recon_loss = 0.0
+    total_vae_kl_loss = 0.0
     total_style_kl_loss = 0.0
+    total_diffusion_recon_loss = 0.0
     
     # 只在主进程显示进度条
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=not is_main_process)
@@ -301,15 +325,23 @@ def train_epoch(
         # 记录损失
         total_loss += losses['total_loss'].item()
         total_diffusion_loss += losses['diffusion_loss'].item()
+        total_vae_recon_loss += losses['vae_recon_loss'].item()
+        total_vae_kl_loss += losses['vae_kl_loss'].item()
+        total_diffusion_recon_loss += losses['diffusion_recon_loss'].item()
         if losses['style_kl_loss'] is not None:
             total_style_kl_loss += losses['style_kl_loss'].item()
         
         # 更新进度条
-        pbar.set_postfix({
+        postfix_dict = {
             'loss': f"{losses['total_loss'].item():.4f}",
             'diff': f"{losses['diffusion_loss'].item():.4f}",
-            'kl': f"{losses['style_kl_loss'].item() if losses['style_kl_loss'] is not None else 0:.4f}"
-        })
+            'vae_recon': f"{losses['vae_recon_loss'].item():.4f}",
+            'vae_kl': f"{losses['vae_kl_loss'].item():.6f}",
+            'style_kl': f"{losses['style_kl_loss'].item() if losses['style_kl_loss'] is not None else 0:.4f}"
+        }
+        if losses['diffusion_recon_loss'].item() > 0:
+            postfix_dict['diff_recon'] = f"{losses['diffusion_recon_loss'].item():.4f}"
+        pbar.set_postfix(postfix_dict)
         
         # 记录到tensorboard（只在主进程）
         if is_main_process:
@@ -317,18 +349,28 @@ def train_epoch(
             if batch_idx % config.training.log_interval == 0 and writer is not None:
                 writer.add_scalar('train/loss', losses['total_loss'].item(), global_step)
                 writer.add_scalar('train/diffusion_loss', losses['diffusion_loss'].item(), global_step)
+                writer.add_scalar('train/vae_recon_loss', losses['vae_recon_loss'].item(), global_step)
+                writer.add_scalar('train/vae_kl_loss', losses['vae_kl_loss'].item(), global_step)
+                if losses['diffusion_recon_loss'].item() > 0:
+                    writer.add_scalar('train/diffusion_recon_loss', losses['diffusion_recon_loss'].item(), global_step)
                 if losses['style_kl_loss'] is not None:
                     writer.add_scalar('train/style_kl_loss', losses['style_kl_loss'].item(), global_step)
             writer.add_scalar('train/learning_rate', scheduler.get_last_lr()[0], global_step)
     
     avg_loss = total_loss / len(dataloader)
     avg_diffusion_loss = total_diffusion_loss / len(dataloader)
+    avg_vae_recon_loss = total_vae_recon_loss / len(dataloader)
+    avg_vae_kl_loss = total_vae_kl_loss / len(dataloader)
     avg_style_kl_loss = total_style_kl_loss / len(dataloader)
+    avg_diffusion_recon_loss = total_diffusion_recon_loss / len(dataloader)
     
     return {
         'loss': avg_loss,
         'diffusion_loss': avg_diffusion_loss,
-        'style_kl_loss': avg_style_kl_loss
+        'vae_recon_loss': avg_vae_recon_loss,
+        'vae_kl_loss': avg_vae_kl_loss,
+        'style_kl_loss': avg_style_kl_loss,
+        'diffusion_recon_loss': avg_diffusion_recon_loss
     }
 
 
@@ -371,39 +413,51 @@ def validate(
     return avg_loss
 
 
-def main():
-    parser = argparse.ArgumentParser(description='训练风格嵌入扩散模型')
-    parser.add_argument('--config', type=str, default=None, help='配置文件路径')
-    parser.add_argument('--data_root', type=str, default='data', help='数据根目录')
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints', help='检查点目录')
-    parser.add_argument('--resume', type=str, default=None, help='恢复训练的检查点路径')
-    parser.add_argument('--data_ratio', type=float, default=1.0, help='使用数据的比例（0.0-1.0），例如0.01表示使用1%%的数据')
+def main_worker(rank, world_size, args):
+    """
+    单个训练进程的工作函数（用于DDP）
     
-    # DDP相关参数（torchrun会自动设置这些环境变量，通常不需要手动指定）
-    # 兼容 --local-rank 和 --local_rank 两种格式（torch.distributed.launch使用--local-rank）
-    parser.add_argument('--local-rank', '--local_rank', type=int, default=-1, dest='local_rank', 
-                       help='本地GPU rank（torchrun自动设置，通常不需要手动指定）')
-    parser.add_argument('--world_size', type=int, default=-1, 
-                       help='总进程数（torchrun自动设置，通常不需要手动指定）')
-    parser.add_argument('--rank', type=int, default=-1, 
-                       help='全局rank（torchrun自动设置，通常不需要手动指定）')
-    # MASTER_ADDR和MASTER_PORT：torchrun会自动设置，只有在特殊情况下才需要手动指定
-    parser.add_argument('--master_addr', '--master-addr', type=str, 
-                       default=None, dest='master_addr', 
-                       help='主节点地址（torchrun自动设置，通常不需要手动指定）')
-    parser.add_argument('--master_port', '--master-port', type=str, 
-                       default=None, dest='master_port', 
-                       help='主节点端口（torchrun自动设置，通常不需要手动指定）')
+    Args:
+        rank: 当前进程的rank
+        world_size: 总进程数
+        args: 命令行参数
+    """
+    # 设置当前进程的GPU
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank)
+        device = torch.device(f'cuda:{rank}')
+    else:
+        device = torch.device('cpu')
     
-    args = parser.parse_args()
+    # 设置DDP环境变量（用于后续代码检测）
+    os.environ['RANK'] = str(rank)
+    os.environ['WORLD_SIZE'] = str(world_size)
+    os.environ['LOCAL_RANK'] = str(rank)
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
     
+    # 调用实际的训练函数
+    _train_main(args, device, rank, world_size, is_main_process=(rank == 0))
+
+
+def _train_main(args, device, rank=0, world_size=1, is_main_process=True):
+    """
+    实际的训练主函数
+    
+    Args:
+        args: 命令行参数
+        device: 设备
+        rank: 当前进程rank（单GPU时为0）
+        world_size: 总进程数（单GPU时为1）
+        is_main_process: 是否为主进程
+    """
     # 初始化分布式训练
     use_ddp = False
     num_available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     
     # 检查环境变量（torchrun和torch.distributed.launch都会设置）
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        # 使用torchrun或torch.distributed.launch启动
+        # 使用torchrun或torch.distributed.launch启动，或由main_worker设置
         args.rank = int(os.environ['RANK'])
         args.world_size = int(os.environ['WORLD_SIZE'])
         # LOCAL_RANK可能不存在（torch.distributed.launch使用--local-rank参数）
@@ -413,29 +467,25 @@ def main():
             # 如果没有LOCAL_RANK环境变量，尝试从RANK推断（单节点情况）
             args.local_rank = args.rank
         
-        # 如果WORLD_SIZE=1，说明只启动了1个进程，不需要DDP
-        if args.world_size == 1:
-            print(f"[DEBUG] 检测到DDP环境变量但WORLD_SIZE=1，禁用DDP，使用单GPU训练")
-            use_ddp = False
-        else:
+        # 如果WORLD_SIZE > 1，使用DDP
+        if args.world_size > 1:
             use_ddp = True
             print(f"[DEBUG] 检测到DDP环境变量: RANK={args.rank}, WORLD_SIZE={args.world_size}, LOCAL_RANK={args.local_rank}")
+        else:
+            use_ddp = False
+            if is_main_process:
+                print(f"[DEBUG] 检测到DDP环境变量但WORLD_SIZE=1，禁用DDP，使用单GPU训练")
     elif args.local_rank != -1:
         # 手动设置DDP
         args.rank = args.rank if args.rank != -1 else args.local_rank
         args.world_size = args.world_size if args.world_size != -1 else num_available_gpus
         use_ddp = True
         print(f"[DEBUG] 手动设置DDP: rank={args.rank}, world_size={args.world_size}, local_rank={args.local_rank}")
-    elif num_available_gpus > 1:
-        # 自动检测多GPU，提示使用DDP
-        print(f"\n⚠️  检测到 {num_available_gpus} 张GPU，但未启用DDP")
-        print(f"   当前将使用单GPU训练（GPU 0）")
-        print(f"\n   要使用所有GPU进行DDP训练，请使用以下命令：")
-        print(f"   torchrun --nproc_per_node={num_available_gpus} train.py \\")
-        print(f"       --data_root <data_path> \\")
-        print(f"       --checkpoint_dir <checkpoint_path>")
-        print(f"\n   或者如果使用调度系统（如Slurm），请确保设置了正确的环境变量")
-        print(f"   继续使用单GPU训练...\n")
+    else:
+        # 没有DDP环境变量，单GPU训练
+        use_ddp = False
+        if is_main_process:
+            print(f"[DEBUG] 未检测到DDP环境变量，使用单GPU训练")
     
     if use_ddp:
         # 初始化进程组
@@ -444,11 +494,10 @@ def main():
             master_addr = os.environ.get('MASTER_ADDR') or args.master_addr or 'localhost'
             master_port = os.environ.get('MASTER_PORT') or args.master_port or '12355'
             
-            print(f"[DEBUG] 正在初始化DDP进程组...")
-            print(f"  backend=nccl, rank={args.rank}, world_size={args.world_size}")
-            print(f"  master_addr={master_addr}, master_port={master_port}")
-            if 'MASTER_ADDR' in os.environ or 'MASTER_PORT' in os.environ:
-                print(f"  (使用torchrun设置的环境变量)")
+            if is_main_process:
+                print(f"[DEBUG] 正在初始化DDP进程组...")
+                print(f"  backend=nccl, rank={args.rank}, world_size={args.world_size}")
+                print(f"  master_addr={master_addr}, master_port={master_port}")
             
             dist.init_process_group(
                 backend='nccl',
@@ -460,7 +509,8 @@ def main():
             torch.cuda.set_device(args.local_rank)
             device = torch.device(f'cuda:{args.local_rank}')
             is_main_process = (args.rank == 0)
-            print(f"[DEBUG] ✓ DDP进程组初始化成功")
+            if is_main_process:
+                print(f"[DEBUG] ✓ DDP进程组初始化成功")
         except Exception as e:
             print(f"[ERROR] DDP初始化失败: {e}")
             print(f"回退到单GPU训练")
@@ -645,8 +695,9 @@ def main():
     
     # DDP包装模型
     if use_ddp:
-        # 启用find_unused_parameters=True，因为某些参数可能在某些条件下不参与loss计算
-        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
+        # 修复VAE训练后，所有参数都参与损失计算，无需find_unused_parameters
+        # 设置为False可以提升性能（避免每次迭代额外遍历autograd图）
+        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=False)
         if is_main_process:
             print(f"\n✓ 使用DDP在 {args.world_size} 张GPU上训练")
             print(f"  每张GPU的batch_size: {per_gpu_batch_size}")
@@ -659,10 +710,53 @@ def main():
         weight_decay=config.training.weight_decay
     )
     
-    scheduler = optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lambda step: min(step / config.training.warmup_steps, 1.0)
-    )
+    # 计算总训练步数（用于学习率调度）
+    total_steps = len(train_loader) * config.training.num_epochs
+    
+    # 创建学习率调度器
+    scheduler_type = config.training.lr_scheduler.lower()
+    if scheduler_type == "constant":
+        # 简单的warmup后保持恒定学习率（原始策略）
+        scheduler = optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: min(step / config.training.warmup_steps, 1.0)
+        )
+    elif scheduler_type == "cosine":
+        # Warmup + Cosine Annealing（推荐）
+        def lr_lambda(step):
+            if step < config.training.warmup_steps:
+                # Warmup阶段：线性增长
+                return step / config.training.warmup_steps
+            else:
+                # Cosine decay阶段
+                progress = (step - config.training.warmup_steps) / (total_steps - config.training.warmup_steps)
+                min_lr_ratio = config.training.min_lr / config.training.learning_rate
+                return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + np.cos(np.pi * progress))
+        
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    elif scheduler_type == "linear":
+        # Warmup + Linear Decay
+        def lr_lambda(step):
+            if step < config.training.warmup_steps:
+                # Warmup阶段：线性增长
+                return step / config.training.warmup_steps
+            else:
+                # Linear decay阶段
+                progress = (step - config.training.warmup_steps) / (total_steps - config.training.warmup_steps)
+                min_lr_ratio = config.training.min_lr / config.training.learning_rate
+                return max(min_lr_ratio, 1.0 - progress)
+        
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    else:
+        raise ValueError(f"Unknown lr_scheduler: {scheduler_type}. Choose from 'constant', 'cosine', 'linear'")
+    
+    if is_main_process:
+        print(f"✓ 学习率调度策略: {scheduler_type}")
+        print(f"  初始学习率: {config.training.learning_rate}")
+        print(f"  Warmup步数: {config.training.warmup_steps}")
+        print(f"  总训练步数: {total_steps}")
+        if scheduler_type != "constant":
+            print(f"  最小学习率: {config.training.min_lr}")
     
     # 混合精度（仅在CUDA可用时启用）
     # 检查device是否为CUDA设备
@@ -787,6 +881,80 @@ def main():
     # 清理分布式进程组
     if use_ddp:
         dist.destroy_process_group()
+
+
+def main():
+    """
+    主入口函数：解析参数，检测多GPU并自动启动DDP训练
+    """
+    parser = argparse.ArgumentParser(description='训练风格嵌入扩散模型')
+    parser.add_argument('--config', type=str, default=None, help='配置文件路径')
+    parser.add_argument('--data_root', type=str, default='data', help='数据根目录')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints', help='检查点目录')
+    parser.add_argument('--resume', type=str, default=None, help='恢复训练的检查点路径')
+    parser.add_argument('--data_ratio', type=float, default=1.0, help='使用数据的比例（0.0-1.0），例如0.01表示使用1%%的数据')
+    
+    # DDP相关参数（torchrun会自动设置这些环境变量，通常不需要手动指定）
+    parser.add_argument('--local-rank', '--local_rank', type=int, default=-1, dest='local_rank', 
+                       help='本地GPU rank（torchrun自动设置，通常不需要手动指定）')
+    parser.add_argument('--world_size', type=int, default=-1, 
+                       help='总进程数（torchrun自动设置，通常不需要手动指定）')
+    parser.add_argument('--rank', type=int, default=-1, 
+                       help='全局rank（torchrun自动设置，通常不需要手动指定）')
+    parser.add_argument('--master_addr', '--master-addr', type=str, 
+                       default=None, dest='master_addr', 
+                       help='主节点地址（torchrun自动设置，通常不需要手动指定）')
+    parser.add_argument('--master_port', '--master-port', type=str, 
+                       default=None, dest='master_port', 
+                       help='主节点端口（torchrun自动设置，通常不需要手动指定）')
+    
+    args = parser.parse_args()
+    
+    # 检测GPU数量
+    num_available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    
+    # 检查是否已有DDP环境变量（torchrun启动）
+    has_ddp_env = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
+    
+    # 如果使用torchrun但WORLD_SIZE=1，且有多GPU，提示用户
+    if has_ddp_env:
+        world_size = int(os.environ.get('WORLD_SIZE', '1'))
+        if world_size == 1 and num_available_gpus > 1:
+            # torchrun启动了但只启动了1个进程，提示用户需要指定--nproc_per_node
+            print(f"\n⚠️  检测到 {num_available_gpus} 张GPU，但torchrun只启动了1个进程")
+            print(f"   要使用所有GPU，请重新运行并指定 --nproc_per_node：")
+            print(f"\n   torchrun --nproc_per_node={num_available_gpus} train.py \\")
+            cmd_parts = []
+            if args.data_root and args.data_root != 'data':
+                cmd_parts.append(f"       --data_root {args.data_root}")
+            if args.checkpoint_dir and args.checkpoint_dir != 'checkpoints':
+                cmd_parts.append(f"       --checkpoint_dir {args.checkpoint_dir}")
+            if args.config:
+                cmd_parts.append(f"       --config {args.config}")
+            if args.resume:
+                cmd_parts.append(f"       --resume {args.resume}")
+            if cmd_parts:
+                print(" \\\n".join(cmd_parts))
+            print(f"\n   或者直接运行（会自动使用所有GPU）：")
+            print(f"   python train.py" + (" " + " ".join(cmd_parts).replace(" \\\n       ", " ").replace("       ", "")) if cmd_parts else "")
+            print(f"\n   继续使用单GPU训练...\n")
+    
+    # 如果没有DDP环境变量，且有多GPU，自动启动多进程训练
+    if not has_ddp_env and num_available_gpus > 1:
+        print(f"\n✓ 检测到 {num_available_gpus} 张GPU，自动启动多GPU训练")
+        print(f"  使用 torch.multiprocessing.spawn 启动 {num_available_gpus} 个进程\n")
+        
+        # 使用spawn方法启动多进程
+        torch.multiprocessing.spawn(
+            main_worker,
+            args=(num_available_gpus, args),
+            nprocs=num_available_gpus,
+            join=True
+        )
+    else:
+        # 单GPU训练或已有DDP环境变量（WORLD_SIZE > 1）
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        _train_main(args, device, rank=0, world_size=1, is_main_process=True)
 
 
 if __name__ == '__main__':

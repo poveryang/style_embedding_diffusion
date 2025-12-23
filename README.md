@@ -169,3 +169,9 @@ style_embedding_diffusion/
 - **风格编码**：VAE结构确保风格向量的正则化
 - **高效采样**：支持DDPM和DDIM两种采样方式
 
+
+---
+### 集群训练脚本
+```bash
+schedctl create --gpu-type 4090D --image "harbor.smoa.cc/junjieyang/style-embedding-diffusion" --cmd "cd /dataset/junjieyang/PyProjs/style_embedding_diffusion && torchrun --nproc_per_node=4 train.py --data_root data --checkpoint_dir checkpoints" --node node69 --gpu 4 --name t0
+```

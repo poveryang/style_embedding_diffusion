@@ -23,6 +23,9 @@ class ModelConfig:
     vae_in_channels: int = 1  # 灰度图
     vae_out_channels: int = 1
     vae_scale_factor: int = 8  # 下采样倍数
+    vae_recon_weight: float = 1.0  # VAE重建损失权重
+    vae_kl_weight: float = 1e-6  # VAE KL散度损失权重
+    diffusion_recon_weight: float = 0.0  # 扩散模型图像重建损失权重（0表示禁用）
     
     # UNet扩散模型
     unet_in_channels: int = 4  # latent channels
@@ -47,10 +50,9 @@ class ModelConfig:
 @dataclass
 class TrainingConfig:
     """训练配置"""
-    batch_size: int = 32  # 总batch_size（所有GPU的总和），DDP时会自动分配到各GPU
-                          # 例如：batch_size=32, 4张GPU → 每张GPU处理8个样本，总有效batch_size=32
+    batch_size: int = 48  # 总batch_size（所有GPU的总和），DDP时会自动分配到各GPU
     learning_rate: float = 1e-4
-    num_epochs: int = 100
+    num_epochs: int = 200
     save_interval: int = 10
     log_interval: int = 100
     checkpoint_dir: str = "checkpoints"
@@ -63,7 +65,9 @@ class TrainingConfig:
     # 优化器
     optimizer: str = "adamw"
     weight_decay: float = 0.01
-    warmup_steps: int = 1000
+    warmup_steps: int = 2000  # Warmup步数
+    lr_scheduler: str = "cosine"  # 学习率调度策略: "constant", "cosine", "linear"
+    min_lr: float = 1e-6  # 最小学习率（用于cosine/linear decay）
     
     # 混合精度
     use_amp: bool = True

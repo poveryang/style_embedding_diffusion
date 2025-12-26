@@ -120,39 +120,89 @@ class DiffusionScheduler:
         
         return pred_x0
     
-    def step(self, model_output: torch.Tensor, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    def step(
+        self, 
+        model_output: torch.Tensor, 
+        t: torch.Tensor, 
+        x: torch.Tensor,
+        prev_t: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         DDPM采样步骤
+        
+        修复：支持跳步采样，当 prev_t != t-1 时重新计算后验系数
         
         Args:
             model_output: (B, C, H, W) 模型预测的噪声
             t: (B,) 当前时间步
             x: (B, C, H, W) 当前加噪的latent
+            prev_t: (B,) 前一个时间步（如果为None，假设相邻步 t-1）
             
         Returns:
             prev_x: (B, C, H, W) 去噪后的latent
         """
+        if prev_t is None:
+            prev_t = t - 1
+        
         # 确保scheduler的参数与输入数据在同一设备上（支持DataParallel）
         device = x.device
         alphas_cumprod = self.alphas_cumprod.to(device)
-        posterior_mean_coef1 = self.posterior_mean_coef1.to(device)
-        posterior_mean_coef2 = self.posterior_mean_coef2.to(device)
-        posterior_variance = self.posterior_variance.to(device)
+        alphas = self.alphas.to(device)
+        betas = self.betas.to(device)
         
         # 预测x0
         pred_x0 = self.predict_x0_from_noise(model_output, t, x)
         
+        # 检查是否为跳步（prev_t != t - 1）
+        is_skip_step = (prev_t != t - 1).any()
+        
+        if is_skip_step:
+            # 跳步情况：使用正确的后验分布公式
+            # 对于从 t 到 prev_t 的跳步，使用基于 alpha_t 和 alpha_prev 的公式
+            alpha_t = alphas_cumprod[t]
+            alpha_prev = alphas_cumprod[prev_t]
+            
+            one_minus_alpha_t = 1.0 - alpha_t
+            one_minus_alpha_prev = 1.0 - alpha_prev
+            
+            # 计算等效的 beta_step（从 prev_t 到 t 的累积 beta）
+            # alpha_step = alpha_t / alpha_prev 表示从 prev_t 到 t 的累积 alpha
+            alpha_ratio = (alpha_t / alpha_prev.clamp(min=1e-8)).clamp(max=1.0, min=1e-8)
+            beta_step = 1.0 - alpha_ratio
+            
+            # 后验方差: beta_tilde = beta_step * (1 - alpha_prev) / (1 - alpha_t)
+            posterior_var = beta_step * (one_minus_alpha_prev / one_minus_alpha_t.clamp(min=1e-8))
+            posterior_var = posterior_var.view(-1, 1, 1, 1).clamp(min=0.0)
+            
+            # 后验均值系数（标准 DDPM 公式，适用于跳步）
+            # mu_tilde = (sqrt(alpha_prev) * beta_step / (1 - alpha_t)) * x_0 + 
+            #            (sqrt(alpha_t) * (1 - alpha_prev) / (1 - alpha_t)) * x_t
+            sqrt_alpha_prev = torch.sqrt(alpha_prev)
+            sqrt_alpha_t = torch.sqrt(alpha_t)
+            
+            posterior_mean_coef1 = beta_step * sqrt_alpha_prev / one_minus_alpha_t.clamp(min=1e-8)
+            posterior_mean_coef2 = sqrt_alpha_t * one_minus_alpha_prev / one_minus_alpha_t.clamp(min=1e-8)
+            
+            posterior_mean_coef1 = posterior_mean_coef1.view(-1, 1, 1, 1)
+            posterior_mean_coef2 = posterior_mean_coef2.view(-1, 1, 1, 1)
+        else:
+            # 相邻步情况：使用预计算的系数（更高效）
+            posterior_mean_coef1 = self.posterior_mean_coef1.to(device)
+            posterior_mean_coef2 = self.posterior_mean_coef2.to(device)
+            posterior_variance = self.posterior_variance.to(device)
+            
+            posterior_mean_coef1 = posterior_mean_coef1[t].view(-1, 1, 1, 1)
+            posterior_mean_coef2 = posterior_mean_coef2[t].view(-1, 1, 1, 1)
+            posterior_var = posterior_variance[t].view(-1, 1, 1, 1)
+        
         # 计算后验均值
         posterior_mean = (
-            posterior_mean_coef1[t].view(-1, 1, 1, 1) * pred_x0 +
-            posterior_mean_coef2[t].view(-1, 1, 1, 1) * x
+            posterior_mean_coef1 * pred_x0 +
+            posterior_mean_coef2 * x
         )
         
-        # 计算后验方差
-        posterior_var = posterior_variance[t].view(-1, 1, 1, 1)
-        
         # 采样
-        if t[0] == 0:
+        if (prev_t == 0).all():
             return posterior_mean
         else:
             noise = torch.randn_like(x)
@@ -169,12 +219,14 @@ class DiffusionScheduler:
         """
         DDIM采样步骤（确定性采样，更快）
         
+        修复：使用正确的DDIM公式，支持跳步采样（子采样时间步）
+        
         Args:
             model_output: (B, C, H, W) 模型预测的噪声
             t: (B,) 当前时间步
             x: (B, C, H, W) 当前加噪的latent
             eta: DDIM参数，0为完全确定性
-            prev_t: (B,) 前一个时间步
+            prev_t: (B,) 前一个时间步（如果为None，假设相邻步 t-1）
             
         Returns:
             prev_x: (B, C, H, W) 去噪后的latent
@@ -185,7 +237,10 @@ class DiffusionScheduler:
         # 确保scheduler的参数与输入数据在同一设备上（支持DataParallel）
         device = x.device
         alphas_cumprod = self.alphas_cumprod.to(device)
-        posterior_variance = self.posterior_variance.to(device)
+        
+        # 获取 alpha_t 和 alpha_prev
+        alpha_t = alphas_cumprod[t].view(-1, 1, 1, 1)
+        alpha_prev = alphas_cumprod[prev_t].view(-1, 1, 1, 1)
         
         # 预测x0
         sqrt_recip_alphas_cumprod = 1.0 / torch.sqrt(alphas_cumprod)
@@ -194,14 +249,34 @@ class DiffusionScheduler:
         pred_x0 = (sqrt_recip_alphas_cumprod[t].view(-1, 1, 1, 1) * x -
                    sqrt_recipm1_alphas_cumprod[t].view(-1, 1, 1, 1) * model_output)
         
-        # 计算方向指向xt
-        dir_xt = torch.sqrt(1.0 - alphas_cumprod[prev_t].view(-1, 1, 1, 1) - 
-                           eta ** 2 * posterior_variance[t].view(-1, 1, 1, 1)) * model_output
+        # 计算DDIM的sigma_t（支持跳步）
+        # 标准DDIM公式: sigma_t = eta * sqrt((1 - alpha_prev)/(1 - alpha_t) * (1 - alpha_t / alpha_prev))
+        # 当 eta=0 时，sigma_t=0（完全确定性）
+        # 当 alpha_prev >= alpha_t 时，确保数值稳定性
+        one_minus_alpha_t = 1.0 - alpha_t
+        one_minus_alpha_prev = 1.0 - alpha_prev
         
-        # 随机噪声
-        noise = eta * torch.sqrt(posterior_variance[t].view(-1, 1, 1, 1)) * torch.randn_like(x)
+        # 避免除零和负数开方
+        # 如果 alpha_prev >= alpha_t（不应该发生，但为了数值稳定性），使用后验方差
+        if eta > 0:
+            # 计算标准DDIM sigma_t
+            ratio = one_minus_alpha_prev / one_minus_alpha_t.clamp(min=1e-8)
+            alpha_ratio = (alpha_t / alpha_prev.clamp(min=1e-8)).clamp(max=1.0)
+            sigma_t_sq = eta ** 2 * ratio * (1.0 - alpha_ratio)
+            sigma_t_sq = sigma_t_sq.clamp(min=0.0)  # 确保非负
+            sigma_t = torch.sqrt(sigma_t_sq)
+        else:
+            sigma_t = torch.zeros_like(alpha_t)
         
-        prev_x = torch.sqrt(alphas_cumprod[prev_t].view(-1, 1, 1, 1)) * pred_x0 + dir_xt + noise
+        # 计算方向指向xt: dir_xt = sqrt(1 - alpha_prev - sigma_t^2) * eps_pred
+        dir_xt_coef = (1.0 - alpha_prev - sigma_t ** 2).clamp(min=0.0)
+        dir_xt = torch.sqrt(dir_xt_coef) * model_output
+        
+        # 随机噪声: noise = sigma_t * randn_like(x)
+        noise = sigma_t * torch.randn_like(x)
+        
+        # 更新: prev_x = sqrt(alpha_prev) * pred_x0 + dir_xt + noise
+        prev_x = torch.sqrt(alpha_prev) * pred_x0 + dir_xt + noise
         
         return prev_x
 

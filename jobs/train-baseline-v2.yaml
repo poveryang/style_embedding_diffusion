@@ -1,0 +1,12 @@
+# 风格注入改为交叉注意力
+Name: baseline-v2
+Image: harbor.smoa.cc/junjieyang/style-embedding-diffusion
+Command: >
+  cd /dataset/junjieyang/PyProjs/style_embedding_diffusion &&
+  python train.py 
+  --data_root data 
+  --batch_size 48
+  --job_name baseline-v2
+GPU: 8
+GPUType: 4090D
+Node: node63

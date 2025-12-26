@@ -1,0 +1,8 @@
+Name: baseline
+Image: harbor.smoa.cc/junjieyang/style-embedding-diffusion
+Command: >
+  cd /dataset/junjieyang/PyProjs/style_embedding_diffusion &&
+  python train.py --data_root data --job_name baseline --batch_size 24
+GPU: 4
+GPUType: 4090D
+Node: node76

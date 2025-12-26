@@ -1,0 +1,16 @@
+# 1. 标准化 VAE latent
+# 2. 提供更大的表征空间，增强风格表达能力（从256增加到512）
+# 3. 降低 KL 正则约束，允许风格编码器学习更丰富的风格表征（1e-2->1e-4）
+# 4. 使用更高的学习率进行训练，提高训练速度和稳定性
+# 5. 增大风格编码器 base_dim，从64增加到128
+Name: baseline-v3
+Image: harbor.smoa.cc/junjieyang/style-embedding-diffusion
+Command: >
+  cd /dataset/junjieyang/PyProjs/style_embedding_diffusion &&
+  python train.py 
+  --data_root data 
+  --batch_size 48
+  --job_name baseline-v3
+GPU: 8
+GPUType: 4090D
+Node: node86

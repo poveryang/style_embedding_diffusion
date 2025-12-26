@@ -107,6 +107,30 @@ class StyleEncoder(nn.Module):
             kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
             kl_loss = kl_loss.mean() * self.kl_weight
             
+            # 存储统计信息（用于诊断）
+            if self.training:
+                self._last_mu_stats = {
+                    'mu_mean': mu.mean().item(),
+                    'mu_std': mu.std().item(),
+                    'mu_min': mu.min().item(),
+                    'mu_max': mu.max().item(),
+                }
+                self._last_logvar_stats = {
+                    'logvar_mean': logvar.mean().item(),
+                    'logvar_std': logvar.std().item(),
+                    'logvar_min': logvar.min().item(),
+                    'logvar_max': logvar.max().item(),
+                }
+                self._last_z_style_stats = {
+                    'z_style_mean': z_style.mean().item(),
+                    'z_style_std': z_style.std().item(),
+                    'z_style_min': z_style.min().item(),
+                    'z_style_max': z_style.max().item(),
+                }
+                # 计算原始KL散度（未加权）
+                raw_kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
+                self._last_raw_kl = raw_kl.item()
+            
             return z_style, kl_loss
         else:
             # 直接映射

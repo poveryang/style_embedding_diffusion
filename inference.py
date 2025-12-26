@@ -130,7 +130,9 @@ class StyleEmbeddingDiffusionModel(nn.Module):
                 prev_t = timesteps[i + 1] if i < len(timesteps) - 1 else torch.tensor(0, device=I_bin.device)
                 z_t = self.scheduler.ddim_step(eps_pred, t_batch, z_t, eta, prev_t.unsqueeze(0))
             else:
-                z_t = self.scheduler.step(eps_pred, t_batch, z_t)
+                # DDPM 也需要 prev_t 参数以支持跳步采样
+                prev_t = timesteps[i + 1] if i < len(timesteps) - 1 else torch.tensor(0, device=I_bin.device)
+                z_t = self.scheduler.step(eps_pred, t_batch, z_t, prev_t=prev_t.unsqueeze(0))
         
         # 4. 解码生成图像
         I_gen = self.vae.decode(z_t)

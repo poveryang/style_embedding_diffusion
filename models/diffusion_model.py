@@ -47,6 +47,7 @@ class ResBlock(nn.Module):
         )
         
         # 风格条件
+        # 注意：cross_attn 不需要在 ResBlock 中创建任何层，风格通过 CrossAttentionBlock 注入
         if style_dim is not None:
             if style_condition_type == "adain":
                 self.style_scale = nn.Linear(style_dim, out_channels)
@@ -54,6 +55,7 @@ class ResBlock(nn.Module):
             elif style_condition_type == "film":
                 self.style_gamma = nn.Linear(style_dim, out_channels)
                 self.style_beta = nn.Linear(style_dim, out_channels)
+            # cross_attn: 风格通过 CrossAttentionBlock 注入，ResBlock 中不需要处理
         
         # 卷积层
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
@@ -92,6 +94,7 @@ class ResBlock(nn.Module):
                 gamma = self.style_gamma(style_emb)[:, :, None, None]
                 beta = self.style_beta(style_emb)[:, :, None, None]
                 x = x * (1 + gamma) + beta
+            # cross_attn: 风格通过 CrossAttentionBlock 注入，这里不需要处理
         
         x = F.silu(x)
         
@@ -132,6 +135,77 @@ class AttentionBlock(nn.Module):
         
         # 重塑回空间维度
         out = rearrange(out, 'b h c (h1 w1) -> b (h c) h1 w1', h1=H, w1=W)
+        out = self.proj(out)
+        
+        return out + residual
+
+
+class CrossAttentionBlock(nn.Module):
+    """交叉注意力块：使用风格嵌入作为 key/value，特征图作为 query"""
+    def __init__(self, channels: int, style_emb_dim: int, num_heads: int = 8):
+        """
+        Args:
+            channels: 特征图通道数（用于 query 相关的层）
+            style_emb_dim: 投影后的风格嵌入维度（用于 key/value 投影，通常是 model_channels）
+            num_heads: 注意力头数
+        """
+        super().__init__()
+        self.channels = channels
+        self.style_emb_dim = style_emb_dim
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        
+        # Query 来自特征图 x
+        self.norm = nn.GroupNorm(32, channels)
+        self.q_proj = nn.Conv2d(channels, channels, 1)
+        
+        # Key/Value 来自风格嵌入 style_emb（注意：style_emb 已经在 UNet 中被投影到 style_emb_dim 维度）
+        self.kv_proj = nn.Linear(style_emb_dim, channels * 2)
+        
+        # 输出投影
+        self.proj = nn.Conv2d(channels, channels, 1)
+    
+    def forward(self, x: torch.Tensor, style_emb: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, channels, H, W) 特征图（作为 query）
+            style_emb: (B, channels) 风格嵌入（作为 key/value，已在 UNet 中被投影到 channels 维度）
+            
+        Returns:
+            out: (B, channels, H, W) 交叉注意力输出
+        """
+        B, C, H, W = x.shape
+        residual = x
+        
+        # Query: 从特征图 x 生成
+        x_norm = self.norm(x)
+        q = self.q_proj(x_norm)  # (B, C, H, W)
+        
+        # Key/Value: 从风格嵌入 style_emb 生成
+        kv = self.kv_proj(style_emb)  # (B, 2*C)
+        k, v = kv.chunk(2, dim=1)  # 每个都是 (B, C)
+        
+        # 重塑为多头注意力
+        # Query: (B, C, H, W) -> (B, num_heads, H*W, head_dim)
+        q = rearrange(q, 'b (h d) h1 w1 -> b h (h1 w1) d', h=self.num_heads, d=self.head_dim)
+        
+        # Key/Value: (B, C) -> (B, num_heads, head_dim, 1)
+        k = rearrange(k, 'b (h d) -> b h d 1', h=self.num_heads, d=self.head_dim)
+        v = rearrange(v, 'b (h d) -> b h d 1', h=self.num_heads, d=self.head_dim)
+        
+        # 交叉注意力计算: Q @ K -> (B, num_heads, H*W, 1)
+        # q: (B, num_heads, H*W, head_dim), k: (B, num_heads, head_dim, 1)
+        scale = self.head_dim ** -0.5
+        attn = torch.softmax(q @ k * scale, dim=-2)  # (B, num_heads, H*W, 1)
+        
+        # 加权求和: attn @ V -> (B, num_heads, H*W, head_dim)
+        # attn: (B, num_heads, H*W, 1), v: (B, num_heads, head_dim, 1)
+        # 需要将 v 扩展并转置: (B, num_heads, 1, head_dim)
+        v_expanded = v.transpose(-2, -1)  # (B, num_heads, 1, head_dim)
+        out = attn @ v_expanded  # (B, num_heads, H*W, head_dim)
+        
+        # 重塑回空间维度: (B, num_heads, H*W, head_dim) -> (B, C, H, W)
+        out = rearrange(out, 'b h (h1 w1) d -> b (h d) h1 w1', h1=H, w1=W)
         out = self.proj(out)
         
         return out + residual
@@ -231,8 +305,16 @@ class ConditionalUNet(nn.Module):
                 
                 layers = [
                     ResBlock(ch, out_ch, time_emb_dim, style_dim, style_condition_type),
-                    AttentionBlock(out_ch) if mult in attention_resolutions else nn.Identity()
                 ]
+                # 添加注意力层：如果使用 cross_attn，在 attention_resolutions 处添加交叉注意力
+                if mult in attention_resolutions:
+                    if style_condition_type == "cross_attn" and style_dim is not None:
+                        # CrossAttentionBlock 的 kv_proj 需要使用 model_channels（投影后的 style_emb 维度）
+                        layers.append(CrossAttentionBlock(out_ch, model_channels))
+                    else:
+                        layers.append(AttentionBlock(out_ch))
+                else:
+                    layers.append(nn.Identity())
                 self.down_blocks.append(nn.ModuleList(layers))
                 ch = out_ch
                 input_block_channels.append(ch)
@@ -243,7 +325,11 @@ class ConditionalUNet(nn.Module):
         
         # 中间块
         self.mid_block1 = ResBlock(ch, ch, time_emb_dim, style_dim, style_condition_type)
-        self.mid_attn = AttentionBlock(ch)
+        if style_condition_type == "cross_attn" and style_dim is not None:
+            # CrossAttentionBlock 的 kv_proj 需要使用 model_channels（投影后的 style_emb 维度）
+            self.mid_attn = CrossAttentionBlock(ch, model_channels)
+        else:
+            self.mid_attn = AttentionBlock(ch)
         self.mid_block2 = ResBlock(ch, ch, time_emb_dim, style_dim, style_condition_type)
         
         # 上采样层
@@ -269,8 +355,16 @@ class ConditionalUNet(nn.Module):
                 
                 layers = [
                     ResBlock(ich + ch, och, time_emb_dim, style_dim, style_condition_type),
-                    AttentionBlock(och) if mult in attention_resolutions else nn.Identity()
                 ]
+                # 添加注意力层：如果使用 cross_attn，在 attention_resolutions 处添加交叉注意力
+                if mult in attention_resolutions:
+                    if style_condition_type == "cross_attn" and style_dim is not None:
+                        # CrossAttentionBlock 的 kv_proj 需要使用 model_channels（投影后的 style_emb 维度）
+                        layers.append(CrossAttentionBlock(och, model_channels))
+                    else:
+                        layers.append(AttentionBlock(och))
+                else:
+                    layers.append(nn.Identity())
                 
                 # 上采样：每个 level 的最后一个 block 后上采样，但第一个 level（最底层）不上采样
                 # 注意：上采样在 forward 中执行，这里不添加
@@ -331,6 +425,8 @@ class ConditionalUNet(nn.Module):
                 for layer in block_list:
                     if isinstance(layer, ResBlock):
                         x = layer(x, time_emb, style_emb)
+                    elif isinstance(layer, CrossAttentionBlock):
+                        x = layer(x, style_emb)
                     else:
                         x = layer(x)
                 h.append(x)
@@ -338,7 +434,10 @@ class ConditionalUNet(nn.Module):
         
         # 中间块
         x = self.mid_block1(x, time_emb, style_emb)
-        x = self.mid_attn(x)
+        if isinstance(self.mid_attn, CrossAttentionBlock):
+            x = self.mid_attn(x, style_emb)
+        else:
+            x = self.mid_attn(x)
         x = self.mid_block2(x, time_emb, style_emb)
         
         # 反转 h 列表，使其与上采样顺序匹配
@@ -366,6 +465,8 @@ class ConditionalUNet(nn.Module):
             for layer in block_list:
                 if isinstance(layer, ResBlock):
                     x = layer(x, time_emb, style_emb)
+                elif isinstance(layer, CrossAttentionBlock):
+                    x = layer(x, style_emb)
                 elif isinstance(layer, (AttentionBlock, nn.Identity)):
                     x = layer(x)
             
